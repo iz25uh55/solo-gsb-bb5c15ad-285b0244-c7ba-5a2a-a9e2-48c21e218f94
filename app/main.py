@@ -20,7 +20,12 @@ from .database import (
 )
 from .diff_audit import DiffParseError, audit_diff, highest_risk
 from .gate import GateRule, evaluate_record
-from .identifiers import IdentifierLexError, scan_identifiers
+from .identifiers import (
+    CollisionGroupNotFoundError,
+    IdentifierLexError,
+    preview_collision_fix,
+    scan_identifiers,
+)
 from .json_audit import (
     DuplicateKeyError,
     JsonParseError,
@@ -33,6 +38,7 @@ from .schemas import (
     CompareRequest,
     DiffAuditRequest,
     GateRequest,
+    IdentifierCollisionFixRequest,
     IdentifierNormalizationRequest,
     JsonAuditRequest,
 )
@@ -332,6 +338,60 @@ def read_identifier_normalization(report_id: int) -> dict:
     return record
 
 
+@app.post("/api/v1/identifiers/normalization/fix-preview")
+def preview_identifier_collision_fix(
+    payload: IdentifierCollisionFixRequest,
+) -> dict:
+    """Preview fixing one NFKC collision group without storing anything.
+
+    The source is lexed with the same scanner as the normalization report
+    and the requested group is located by its NFKC normalised name.  Only
+    the group's non-canonical identifier spellings are rewritten to the
+    normalised spelling; string literals, comments and every other
+    character are preserved verbatim, as are the BOM and line endings.
+    The response lists every edit (original-source codepoint span, raw
+    spelling, replacement), carries the fixed source and reports the
+    collisions found by rescanning it.  A lexical failure, or a name that
+    does not identify a collision group, yields 422 and writes no record.
+    """
+    try:
+        preview = preview_collision_fix(
+            payload.source, payload.normalised_name
+        )
+    except IdentifierLexError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "offset": exc.offset,
+                "line": exc.line,
+                "column": exc.column,
+                "message": exc.message,
+            },
+        )
+    except CollisionGroupNotFoundError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "collision_group_not_found",
+                "normalised": exc.normalised,
+                "message": (
+                    "no NFKC collision group with normalised name "
+                    f"{exc.normalised!r}; a fixable group requires at "
+                    "least two distinct raw identifier spellings"
+                ),
+            },
+        )
+
+    body = preview.to_dict()
+    return {
+        "stored": False,
+        "source_length": len(payload.source),
+        "fixed_source_length": len(preview.fixed_source),
+        **body,
+    }
+
+
 @app.get("/api/v1/audits")
 def list_audits(
     risk_level: Optional[RiskLevel] = Query(
@@ -406,6 +466,7 @@ def root() -> dict:
             "POST /api/v1/audits/compare",
             "POST /api/v1/audits/gate",
             "POST /api/v1/identifiers/normalization",
+            "POST /api/v1/identifiers/normalization/fix-preview",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",

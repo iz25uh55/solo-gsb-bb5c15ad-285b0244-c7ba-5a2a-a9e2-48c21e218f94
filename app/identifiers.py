@@ -21,6 +21,15 @@ string/statement, inconsistent indentation ...) raises
 :class:`IdentifierLexError` carrying the original-source position before
 any report is produced, so a rejected source never produces an audit
 result.
+
+A collision *fix preview* (:func:`preview_collision_fix`) reuses this same
+scan to locate one collision group by its NFKC normalised name and rewrites
+only the group's non-canonical spellings to the normalised form.  Because
+the scan covers identifier tokens alone, string literals, comments and all
+other characters are left byte-for-byte untouched; span replacement never
+touches a line ending, and a leading BOM survives as well.  The edited
+source is rescanned so the caller sees the collisions that would remain.
+Nothing is persisted at this layer.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import tokenize
 import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import Optional
 
 # A leading BOM is legal at the very start of a UTF-8 source file; the
 # tokenizer (which works on decoded text) treats one elsewhere as an error.
@@ -61,6 +71,22 @@ class IdentifierLexError(ValueError):
         self.line = line
         self.column = column
         self.error = error
+
+
+class CollisionGroupNotFoundError(ValueError):
+    """No collision group with the requested NFKC normalised name exists.
+
+    A name only matches a *collision* group: it must be the normalised
+    form of at least two distinct raw identifier spellings in the source.
+    A name carried by a single spelling (or by no identifier at all) is
+    not a fixable collision.
+    """
+
+    def __init__(self, normalised: str):
+        super().__init__(
+            f"no NFKC collision group with normalised name {normalised!r}"
+        )
+        self.normalised = normalised
 
 
 @dataclass
@@ -126,6 +152,44 @@ class NormalizationReport:
                 }
                 for c in self.collisions
             ],
+        }
+
+
+@dataclass
+class IdentifierEdit:
+    """One spelling replacement produced by a collision fix preview."""
+
+    offset: int        # codepoint offset of the first character (0-based)
+    end_offset: int    # codepoint offset just past the last character
+    original: str      # raw spelling as found in the source
+    replacement: str   # canonical (NFKC normalised) spelling
+
+
+@dataclass
+class CollisionFixPreview:
+    """The non-persisted result of a collision-group fix preview."""
+
+    target_normalised: str
+    edits: list[IdentifierEdit]
+    fixed_source: str
+    report_before: NormalizationReport
+    report_after: NormalizationReport
+
+    def to_dict(self) -> dict:
+        return {
+            "target_normalised": self.target_normalised,
+            "edit_count": len(self.edits),
+            "edits": [
+                {
+                    "offset": e.offset,
+                    "end_offset": e.end_offset,
+                    "original": e.original,
+                    "replacement": e.replacement,
+                }
+                for e in self.edits
+            ],
+            "fixed_source": self.fixed_source,
+            "report": self.report_after.to_dict(),
         }
 
 
@@ -324,4 +388,66 @@ def scan_identifiers(source: str) -> NormalizationReport:
         distinct_spelling_count=sum(len(m) for m in grouped.values()),
         collision_count=len(collisions),
         collisions=collisions,
+    )
+
+
+def preview_collision_fix(source: str, target_name: str) -> CollisionFixPreview:
+    """Preview fixing one NFKC collision group without persisting anything.
+
+    The source is scanned with :func:`scan_identifiers`; ``target_name`` is
+    NFKC normalised first, so either a raw or a normalised spelling can be
+    supplied.  It must resolve to a collision group (one normalised form
+    shared by at least two distinct raw spellings), otherwise
+    :class:`CollisionGroupNotFoundError` is raised; a lexical failure
+    propagates as :class:`IdentifierLexError`.
+
+    Within the group every occurrence of a *non-canonical* spelling (a raw
+    spelling different from its NFKC normalised form) is rewritten to that
+    form; occurrences already spelled canonically need no edit.  Only those
+    identifier spans change -- comments, strings, keywords and every other
+    character are copied verbatim, and since edits are in-span the BOM and
+    all line endings are preserved.  The edited source is rescanned and the
+    resulting report is returned alongside the edit list (ordered by source
+    position) and the fixed source.
+    """
+    report_before = scan_identifiers(source)
+    target = unicodedata.normalize("NFKC", target_name)
+
+    group: Optional[Collision] = None
+    for collision in report_before.collisions:
+        if collision.normalised == target:
+            group = collision
+            break
+    if group is None:
+        raise CollisionGroupNotFoundError(target)
+
+    edits: list[IdentifierEdit] = []
+    for spelling_group in group.spellings:
+        if spelling_group.spelling == target:
+            # Already canonical: leave every occurrence untouched.
+            continue
+        for occurrence in spelling_group.occurrences:
+            edits.append(
+                IdentifierEdit(
+                    offset=occurrence.offset,
+                    end_offset=occurrence.end_offset,
+                    original=spelling_group.spelling,
+                    replacement=target,
+                )
+            )
+    edits.sort(key=lambda edit: edit.offset)
+
+    # Apply edits from the end backwards so earlier codepoint offsets stay
+    # valid while the string changes length.
+    fixed = source
+    for edit in reversed(edits):
+        fixed = fixed[:edit.offset] + edit.replacement + fixed[edit.end_offset:]
+
+    report_after = scan_identifiers(fixed)
+    return CollisionFixPreview(
+        target_normalised=target,
+        edits=edits,
+        fixed_source=fixed,
+        report_before=report_before,
+        report_after=report_after,
     )
