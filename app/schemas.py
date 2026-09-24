@@ -81,6 +81,25 @@ class IdentifierNormalizationRequest(BaseModel):
     )
 
 
+class IdentifierCollisionFixRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description=(
+            "Python source code to preview a repair on. Lexed with the same "
+            "rules as the normalization report; nothing is persisted."
+        ),
+    )
+    normalised: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "NFKC-normalised name of the collision group to fix. Only "
+            "identifiers in that group whose raw spelling is not this "
+            "canonical spelling are replaced."
+        ),
+    )
+
+
 class GateRuleSpec(BaseModel):
     template: str = Field(
         ...,

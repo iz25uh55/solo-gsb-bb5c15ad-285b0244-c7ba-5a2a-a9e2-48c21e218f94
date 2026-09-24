@@ -50,10 +50,12 @@ docker compose up --build
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
-`POST /api/v1/audits/gate` 与
-`POST /api/v1/identifiers/normalization`
+`POST /api/v1/audits/gate`、
+`POST /api/v1/identifiers/normalization` 与
+`POST /api/v1/identifiers/normalization/fix-preview`
 随服务一起可用（均通过宿主机 8000 端口访问，例如
-<http://localhost:8000/api/v1/identifiers/normalization>）。
+<http://localhost:8000/api/v1/identifiers/normalization/fix-preview>
+或交互式文档 <http://localhost:8000/docs>）。
 
 ### 仅用 Docker
 
@@ -495,6 +497,91 @@ curl -s http://localhost:8000/api/v1/identifiers/normalization/1 | jq
 }
 ```
 
+### `POST /api/v1/identifiers/normalization/fix-preview` — 标识符碰撞修复预览
+
+在不写库的前提下，预览对**一个 NFKC 碰撞组**的修复。请求体给出 Python 源码
+（`source`）与要修复的规范名（`normalised`，即碰撞报告中的 `normalised`）：
+服务复用与检测接口**完全相同的词法扫描**定位该碰撞组，然后——
+
+- **仅**把组内「原文拼写 ≠ 规范拼写」的标识符出现替换为规范拼写；原文已经是
+  规范拼写的出现不改；
+- 其他碰撞组、其他标识符、**字符串字面量、注释、关键字、数字、运算符与所有
+  其他字符一律原样保留**；替换只发生在标识符切片上，因此**前导 BOM、CRLF/LF
+  换行风格与文件末尾是否有换行都不变**；
+- 对修复后的源码**重新词法扫描**，返回修复后的碰撞报告（目标组因只剩一种拼写
+  而从碰撞列表消失，无关组保持不变）。
+
+接口是纯预览：**不保存任何记录**，也不改动输入。返回的 `edits[]` 按源码位置
+排序，每项给出**原文**的起止码点偏移（`offset` / `end_offset`，0 起始、
+end 排他）、原拼写 `original` 与替换文本 `replacement`，可直接在原始源码上
+切片复核；`fixed_source` 是修复后源码，`report` 是对其重新扫描的碰撞报告。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/identifiers/normalization/fix-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "def café():\n    return Ｘ + 𝐗\ncafé = 2\n",
+       "normalised": "café"}' | jq
+```
+
+响应（节选）：
+
+```json
+{
+  "stored": false,
+  "normalised": "café",
+  "edit_count": 1,
+  "edits": [
+    {
+      "offset": 29,
+      "end_offset": 34,
+      "original": "café",
+      "replacement": "café"
+    }
+  ],
+  "fixed_source": "def café():\n    return Ｘ + 𝐗\ncafé = 2\n",
+  "report": {
+    "identifier_count": 4,
+    "distinct_spelling_count": 3,
+    "collision_count": 1,
+    "collisions": [
+      {"normalised": "X", "...": "另一碰撞组不受本次修复影响，仍然保留"}
+    ]
+  }
+}
+```
+
+> 上例只修复了 `café` 组（分解形式 `e`+U+0301 → 预组合 é），第二行里的
+> 全角 `Ｘ` 与数学粗体 `𝐗` 属于另一个碰撞组，原样保留在 `fixed_source` 中。
+> 若需要一并修复，对同一 `fixed_source` 再以 `"normalised": "X"` 调用一次即可。
+
+说明：
+
+- 当组内**没有任何**原始拼写恰好等于规范拼写（如连字 `ﬁ` 与全角 `ｆｉ`
+  共享规范形 `fi`）时，两种非规范拼写都会被替换为 `fi`。
+- NFKC 规范化是标识符稳定的（符合 [PEP 3131](https://peps.python.org/pep-3131/)）：
+  合法 Python 标识符的 NFKC 仍是合法标识符，因此替换不会改变源码词法结构，
+  修复后的源码必然能被同一词法器扫描。
+- 偏移量是 **Unicode 码点**偏移（含前导 BOM 的 1 个码点），astral 字符
+  （如 `𝐗`）只占 1；`replacement` 的码点长度可能与 `original` 不同，
+  但每个偏移都针对**原始源码**，彼此不重叠。
+
+错误情况（均为 **422**，且**不写入任何记录**）：
+
+| `detail.error` | 条件 |
+|---|---|
+| `collision_group_not_found` | 不存在以 `normalised` 为规范形的碰撞组（包括该名字只有一种拼写、根本不构成碰撞的情况），`detail.normalised` 回显请求值 |
+| `unexpected_character` / `unterminated_string` / `unterminated_statement` / `indentation_error` | 源码词法扫描失败，`detail` 与检测接口一样含 `offset` / `line` / `column` |
+
+```json
+{
+  "detail": {
+    "error": "collision_group_not_found",
+    "normalised": "zzz",
+    "message": "no NFKC collision group with the normalised name 'zzz'"
+  }
+}
+```
+
 ### `GET /api/v1/audits` — 查询历史记录
 
 支持按风险级别精确过滤、按文件名（大小写不敏感子串）过滤与分页：
@@ -900,7 +987,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
-│   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告与码点偏移
+│   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移与修复预览
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
@@ -915,6 +1002,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
+│   ├── test_identifier_fix.py # 标识符碰撞修复预览（仅非规范拼写/字符串注释保留/BOM/CRLF/不落库/422）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
@@ -969,7 +1057,12 @@ astral 平面码点偏移、CRLF 与前导 BOM）、仅不同原文拼写才算�
 大小写不同不算）、fi 连字/全角/数学粗体等 NFKC 碰撞、碰撞与拼写及各拼写内
 出现的源码序稳定性、码点偏移切片复核、词法失败的 422 位置（非法字符、未终止
 字符串/语句、缩进错误，且不落库）、报告独立落库与按 ID 读取、404、缺字段 422
-以及与 bidi 审计表的相互独立性。
+以及与 bidi 审计表的相互独立性；标识符碰撞修复预览覆盖仅替换目标组的非规范
+拼写（规范拼写本身不改、组内无规范拼写时全部替换、三拼写组归一）、其他碰撞
+组与字符串/注释/组外标识符原样保留、编辑按源码序且偏移可在原文切片复核、
+astral 码点偏移、前导 BOM 与 CRLF/LF 及无末尾换行保留、修复后重新扫描使目标
+组消失而无关组保留，以及 422 分支（目标组不存在、单拼写不构成组、词法失败、
+缺字段/空规范名）与预览永不落库（成功与 422 均不产生任何记录）。
 
 ## 设计说明
 
